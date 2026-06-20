@@ -1,0 +1,42 @@
+# --- Secrets / API keys (never commit) ---
+ConsumerKey.txt
+massiveAPIKey
+*.key
+*.pem
+.env
+
+# --- Local database (regenerate with init_db.py) ---
+*.db
+*.db-journal
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# --- Personal financial data ---
+# Fidelity lot/order pastes and generated workbooks
+inputSecurity.txt
+*.xlsx
+
+# --- Generated end-of-day price data ---
+stocksVWAP-*.csv
+
+# --- Bundled DB Browser app (not source) ---
+DB-Browser/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Scratch / temp test files ---
+_*.db
+_*.txt
+_*.py
