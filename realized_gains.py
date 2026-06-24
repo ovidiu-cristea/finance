@@ -2,10 +2,12 @@
 
 Sums the realized_events written by the order pipeline (ingest_orders /
 disambiguate_sells) per account and per ticker, with account subtotals and a
-grand total. Manual dividend events are excluded. Read-only.
+grand total. Manual dividends are excluded. With --include-lending, fully-paid
+securities-lending income (recorded by reconcile_snaptrade) is added as a
+"(lending)" line per account. Read-only.
 
 Usage:
-    python realized_gains.py [--db holdings.db] [--account X] [--ticker X] [--year YYYY]
+    python realized_gains.py [--db X] [--account X] [--ticker X] [--year YYYY] [--include-lending]
 """
 import argparse
 import sqlite3
@@ -22,10 +24,15 @@ def main():
     ap.add_argument("--account", help="Filter by account id or last-4 digits")
     ap.add_argument("--ticker", help="Filter to one ticker (rebrand-aware)")
     ap.add_argument("--year", help="Filter to a calendar year, e.g. 2026")
+    ap.add_argument("--include-lending", action="store_true",
+                    help="Also include securities-lending income (lending_interest events)")
     args = ap.parse_args()
 
-    where = ["r.event_type IN ('realized_gain', 'realized_loss')"]
-    params = []
+    event_types = ["realized_gain", "realized_loss"]
+    if args.include_lending:
+        event_types.append("lending_interest")
+    where = [f"r.event_type IN ({','.join('?' for _ in event_types)})"]
+    params = list(event_types)
     if args.account:
         where.append("(a.id = ? OR a.number LIKE ?)")
         params += [args.account, f"%{args.account}"]
@@ -40,11 +47,11 @@ def main():
     rows = conn.execute(
         f"""
         SELECT a.name, r.symbol,
-               SUM(r.quantity)   AS shares,
-               SUM(r.cost_basis) AS cost,
-               SUM(r.proceeds)   AS proceeds,
-               SUM(r.amount)     AS gain,
-               COUNT(*)          AS events
+               COALESCE(SUM(r.quantity), 0)   AS shares,
+               COALESCE(SUM(r.cost_basis), 0) AS cost,
+               COALESCE(SUM(r.proceeds), 0)   AS proceeds,
+               COALESCE(SUM(r.amount), 0)     AS gain,
+               COUNT(*)                       AS events
         FROM realized_events r
         JOIN accounts a ON a.id = r.account_id
         WHERE {' AND '.join(where)}
@@ -86,7 +93,7 @@ def main():
             a_shares = a_cost = a_proceeds = a_gain = 0.0
             print(f"\n{name}")
             header()
-        line(symbol, shares, cost, proceeds, gain)
+        line(symbol if symbol is not None else "(lending)", shares, cost, proceeds, gain)
         a_shares += shares; a_cost += cost; a_proceeds += proceeds; a_gain += gain
         g_cost += cost; g_proceeds += proceeds; g_gain += gain
     flush_account()

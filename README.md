@@ -75,16 +75,21 @@ python set_targets.py FLNA
 python set_targets.py [ticker] --keep-last-share            # batch, non-interactive
 ```
 
-#### `reconcile_snaptrade.py` — verify the DB against live SnapTrade positions
+#### `reconcile_snaptrade.py` — verify positions + record lending income
 Pulls current positions from SnapTrade and compares per-symbol share counts to
-the open tax lots in the DB. Read-only. Statuses: `OK`, `MISMATCH`,
+the open tax lots in the DB (read-only verification). Statuses: `OK`, `MISMATCH`,
 `MISSING_IN_DB`, `MISSING_IN_SNAPTRADE`, plus benign `IGNORED` rows —
 cash sweeps (`CASH`: SPAXX/FDRXX/…) and Fidelity bookkeeping placeholders such
 as securities-lending collateral (`LENDING`, `kind="other"`). Symbols are
 normalized through the rebrand registry (see `rebrands.py`).
+
+It also records **fully-paid securities-lending interest** ("INTEREST FULLY
+PAID") into `realized_events` as `lending_interest` income — idempotent, deduped
+on SnapTrade's `external_reference_id`. Use `--no-lending` to skip, or
+`--lending-since YYYY-MM-DD` to set the look-back (default 2024-01-01).
 ```
 python reconcile_snaptrade.py <consumer-key-file> [--account X] [--db X]
-python reconcile_snaptrade.py ConsumerKey.txt
+python reconcile_snaptrade.py ConsumerKey.txt [--no-lending] [--lending-since 2024-01-01]
 ```
 
 #### `ingest_orders.py` — apply executed BUY orders to the lot ledger
@@ -112,13 +117,30 @@ python disambiguate_sells.py <consumer-key-file> <TICKER> <paste-file> [--accoun
 python disambiguate_sells.py ConsumerKey.txt QS qs.txt --apply
 ```
 
+#### `recommend_orders.py` — end-of-day trade recommendations
+Suggests, from the DB + an end-of-day price file, what to trade today. **Sells:**
+trailing stop-loss per targeted lot — recommends a SELL STOP at `price × (1 −
+3.5%)` once that clears the lot's profit target, ratcheting up daily (low-target
+lots sell 90%, high-target sell all). **Buys:** average-down trigger — a BUY when
+the price is ≥10% below the cheapest *full* lot's per-share cost (full = a
+low-target/10% lot; 50%-target remainder lots are excluded). v1 base rule;
+buy-side guardrails not yet applied. Price source: `--prices-csv` (the Massive
+VWAP file from `extract_tickers.py`) or live SnapTrade. Read-only. `--all` shows
+every lot/position with its status.
+```
+python recommend_orders.py --prices-csv stocksVWAP-YYYY-MM-DD.csv [--account X] [--all]
+python recommend_orders.py <consumer-key-file> [--account X] [--buffer-pct 3.5]
+```
+
 #### `realized_gains.py` — report realized gains from sell orders
 Sums `realized_events` (written by `ingest_orders` / `disambiguate_sells`) per
 account and per ticker, with account subtotals and a grand total
 (shares / cost basis / proceeds / gain / gain%). Excludes manual dividends.
-Filters: `--account`, `--ticker` (rebrand-aware), `--year`.
+Filters: `--account`, `--ticker` (rebrand-aware), `--year`. With
+`--include-lending`, fully-paid securities-lending income is added as a
+`(lending)` line per account.
 ```
-python realized_gains.py [--account X] [--ticker X] [--year YYYY] [--db X]
+python realized_gains.py [--account X] [--ticker X] [--year YYYY] [--include-lending] [--db X]
 ```
 
 #### `inspect_position.py` — dump a raw SnapTrade position/instrument record

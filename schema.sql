@@ -166,18 +166,22 @@ CREATE TABLE IF NOT EXISTS realized_events (
     account_id   TEXT NOT NULL REFERENCES accounts(id),
     symbol       TEXT REFERENCES securities(symbol),  -- NULL allowed (e.g. cash dividend)
     event_date   TEXT,
-    event_type   TEXT NOT NULL,                -- dividend | realized_gain | realized_loss
-    quantity     REAL,                         -- shares disposed (NULL for dividends)
-    lot_id       INTEGER REFERENCES tax_lots(id),         -- lot relieved (NULL for dividends)
+    event_type   TEXT NOT NULL,                -- dividend | realized_gain | realized_loss | lending_interest
+    quantity     REAL,                         -- shares disposed (NULL for dividends/income)
+    lot_id       INTEGER REFERENCES tax_lots(id),         -- lot relieved (NULL for dividends/income)
     sell_order_id TEXT REFERENCES executed_orders(brokerage_order_id),
     cost_basis   REAL,                         -- cost of the shares relieved
     proceeds     REAL,                         -- proceeds allocated to this lot
-    amount       REAL,                         -- signed P&L (proceeds - cost) or dividend amount
-    notes        TEXT
+    amount       REAL,                         -- signed P&L (proceeds - cost), dividend, or interest amount
+    notes        TEXT,
+    external_ref TEXT                          -- SnapTrade external_reference_id (dedup; NULL for manual/order events)
 );
 
 CREATE INDEX IF NOT EXISTS idx_realized_acct_sym
     ON realized_events (account_id, symbol);
+
+CREATE INDEX IF NOT EXISTS idx_realized_extref
+    ON realized_events (external_ref);
 
 -- ---------------------------------------------------------------------------
 -- Convenience view

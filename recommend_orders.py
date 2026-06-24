@@ -14,6 +14,13 @@ lower it, so you capture the upside and sell when the stock turns down.
 Order size: lots at the low target (10%) sell 90% of their shares (rounded down
 to a whole share); lots at the high target sell the full remaining quantity.
 
+It also suggests average-down BUYS: per (account, symbol), a BUY when the current
+price is >= BUY_DIP_PCT% (10%) below the cheapest FULL lot's per-share cost
+(full = a low-target/10% lot; 50%-target remainder lots are excluded).
+This is the v1 base trigger only - the buy-side guardrails (drawdown-scaled
+sizing, 200-day-MA breaker, position cap, durability whitelist) are not yet
+applied. No size is suggested.
+
 Price source: an end-of-day CSV (e.g. Massive VWAP via extract_tickers.py) with
 --prices-csv, or live SnapTrade positions if a consumer-key file is given.
 
@@ -39,6 +46,11 @@ DEFAULT_BUFFER_PCT = 3.5
 # Lots at the low target sell only part of the position; high-target lots sell all.
 LOW_TARGET_PCT = 10.0
 LOW_SELL_FRACTION = 0.90
+
+# Average-down BUY trigger: buy when price is this % below the cheapest open lot.
+# (v1 base rule only - the buy-side guardrails from STRATEGY.md are not applied yet.)
+BUY_DIP_PCT = 10.0
+EPSILON = 1e-9
 
 
 def sell_quantity(remaining, target_pct):
@@ -82,6 +94,14 @@ def evaluate_lot(per_share, target_pct, price, buffer_pct):
     if price >= target_price:
         return "watch", target_price, arm_price, None
     return "below", target_price, arm_price, None
+
+
+def evaluate_buy(cheapest_cost, price, dip_pct):
+    """Average-down trigger. Returns (armed, threshold) where threshold is the
+    price at/below which to buy (cheapest open lot minus dip_pct%)."""
+    threshold = cheapest_cost * (1 - dip_pct / 100)
+    armed = price is not None and price <= threshold + EPSILON
+    return armed, threshold
 
 
 def read_prices_csv(path):
@@ -143,6 +163,32 @@ def load_lots(db_path, account_filter):
     return rows
 
 
+def load_positions(db_path, account_filter):
+    """Per (account, symbol): cheapest FULL-lot per-share cost, shares, lot count.
+
+    The average-down anchor is the cheapest *full* lot = a low-target (10%) lot.
+    High-target (50%) lots are the trimmed remainders / high-conviction holds and
+    are excluded, so a position needs a low-target lot to be a buy candidate."""
+    rows = sqlite3.connect(db_path).execute(
+        """
+        SELECT t.account_id, a.name, a.number, t.symbol,
+               MIN(t.cost_basis / t.original_quantity) AS cheapest,
+               SUM(t.remaining_quantity)               AS shares,
+               COUNT(*)                                AS lots
+        FROM tax_lots t JOIN accounts a ON a.id = t.account_id
+        WHERE t.status = 'open' AND t.original_quantity > 0
+          AND ABS(t.target_min_profit_pct - ?) < 0.001
+        GROUP BY t.account_id, t.symbol
+        ORDER BY a.name, t.symbol
+        """,
+        (LOW_TARGET_PCT,),
+    ).fetchall()
+    if account_filter:
+        rows = [r for r in rows
+                if r[0] == account_filter or str(r[2] or "").endswith(account_filter)]
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(description="Recommend trailing stop-loss orders.")
     ap.add_argument("key_file", nargs="?",
@@ -157,7 +203,8 @@ def main():
     args = ap.parse_args()
 
     lots = load_lots(args.db, args.account)
-    account_ids = {r[0] for r in lots}
+    positions = load_positions(args.db, args.account)
+    account_ids = {p[0] for p in positions} | {r[0] for r in lots}
 
     if args.prices_csv:
         prices, source = read_prices_csv(args.prices_csv), f"csv {Path(args.prices_csv).name}"
@@ -218,6 +265,45 @@ def main():
         print(f"\n  {len(recs)} order(s), ~${total:,.2f} proceeds at stop.")
     print(f"\nLots: armed={counts['armed']}  watching={counts['watch']}  "
           f"below_target={counts['below']}  no_price={counts['noprice']}")
+
+    # ---- BUY (average-down) recommendations ----
+    print(f"\n=== BUY (average-down) - price <= cheapest full (10%) lot x {1 - BUY_DIP_PCT/100:.2f} ===")
+    print("  (v1 base trigger only; size + buy-side guardrails not applied yet)")
+    buy_recs = []
+    bcounts = {"buy": 0, "hold": 0, "noprice": 0}
+    cur_acct = None
+    for (acct_id, acct, number, symbol, cheapest, shares, nlots) in positions:
+        if cheapest is None:
+            bcounts["noprice"] += 1
+            continue
+        price = prices.get(symbol)
+        armed, threshold = evaluate_buy(cheapest, price, BUY_DIP_PCT)
+        bcounts["buy" if armed else ("noprice" if price is None else "hold")] += 1
+        if armed:
+            buy_recs.append((acct, symbol, price, cheapest, threshold))
+        if args.all:
+            if acct != cur_acct:
+                print(acct)
+                cur_acct = acct
+            pstr = f"${price:,.2f}" if price is not None else "n/a"
+            tag = "BUY" if armed else ("NOPRICE" if price is None else "hold")
+            print(f"  {symbol:<8} cheapest ${cheapest:,.2f}  buy<=${threshold:,.2f}  "
+                  f"last {pstr}  [{tag}]")
+
+    if args.all:
+        print()
+    if buy_recs:
+        cur_acct = None
+        for acct, symbol, price, cheapest, threshold in buy_recs:
+            if acct != cur_acct:
+                print(f"{acct}")
+                cur_acct = acct
+            below = (cheapest - price) / cheapest * 100
+            print(f"  BUY {symbol:<8}  last ${price:,.2f}  "
+                  f"({below:.1f}% below cheapest lot ${cheapest:,.2f}, buy <= ${threshold:,.2f})")
+    else:
+        print("  (none triggered)")
+    print(f"\nPositions: buy={bcounts['buy']}  hold={bcounts['hold']}  no_price={bcounts['noprice']}")
 
 
 if __name__ == "__main__":
