@@ -61,6 +61,17 @@ def load_flags(conn):
         "WHERE manual_flag IS NOT NULL AND manual_flag != ''"))
 
 
+def mark_etf(conn, symbol):
+    """Record a fund/ETF as class 'ETF' (durability is N/A for it) rather than
+    deleting the row - so the buy gate can tell 'it's a fund' from 'unclassified'.
+    Preserves any manual_flag; only touches class + computed_at."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO durability (symbol, class, computed_at) VALUES (?, 'ETF', ?) "
+        "ON CONFLICT(symbol) DO UPDATE SET class='ETF', computed_at=excluded.computed_at",
+        (symbol, now))
+
+
 def line(stmt, key):
     """Pull a numeric line item value from a statement dict, or None."""
     item = (stmt or {}).get(key)

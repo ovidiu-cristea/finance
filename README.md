@@ -190,9 +190,9 @@ away (no full lot left), a BUY once it's ≥25% below its 52-week high. Both are
 **sized** by the largest full lot's **share count** (ever, for re-entry) × a
 drawdown factor (full to −20%, tapering to 0 at −50%), blocked by the 200-day-MA
 breaker (below a *falling* MA for ≥~6 months) and an optional `--position-cap`.
-**Durability gate:** a buy is only recommended for an `ELIGIBLE` name (the
-`durability` table from `build_durability.py`); `HOLD_ONLY` / `TERMINAL` /
-unclassified names are blocked from adds (shown as `durability=<class>`).
+**Durability gate:** names the `durability` table marks `HOLD_ONLY` or `TERMINAL`
+are blocked from adds (shown as `durability=<class>`); `ELIGIBLE`, ETFs (class
+`ETF`), and unrated names fall through to the price guardrails.
 **Exits:** `TERMINAL` names held with shares surface an `EXIT` recommendation —
 the terminal-risk downside exit (e.g. FLNA). `--ignore-durability` turns the gate
 + exits off to show raw price signals. Reads `stock_metrics` (populate with

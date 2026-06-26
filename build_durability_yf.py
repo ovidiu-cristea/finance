@@ -26,7 +26,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-from durability_core import CONFIG, HEADER, compute, fmt_row, load_flags, upsert
+from durability_core import CONFIG, HEADER, compute, fmt_row, load_flags, mark_etf, upsert
 
 HERE = Path(__file__).resolve().parent
 SKIP_QUOTE_TYPES = {"ETF", "MUTUALFUND", "INDEX", "CURRENCY"}
@@ -145,9 +145,9 @@ def classify_tickers(conn, tickers, years=4, delay=1.0, flags=None):
             print(f"  {t:<8} fetch error: {e}")
             continue
         if details.get("quote_type") in SKIP_QUOTE_TYPES:
-            conn.execute("DELETE FROM durability WHERE symbol = ?", (t,))
+            mark_etf(conn, t)
             conn.commit()
-            print(f"  {t:<8} skipped ({details['quote_type'].lower()})")
+            print(f"  {t:<8} {details['quote_type'].lower()} (durability n/a)")
             continue
         if not reports:
             print(f"  {t:<8} no financials on Yahoo")

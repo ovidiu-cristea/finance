@@ -104,9 +104,9 @@ ELIGIBLE — we block buying only on genuine terminal risk, never on unprofitabi
 
 > All thresholds/weights are **placeholders** in `CONFIG`, to be tuned (see *Open
 > items*). Refresh quarterly. **Wired into `recommend_orders.py`** (2026-06-24):
-> buys require `ELIGIBLE`; `HOLD_ONLY`/`TERMINAL`/unclassified block adds;
-> `TERMINAL` held names surface an `EXIT` recommendation. `--ignore-durability`
-> shows raw price signals.
+> `HOLD_ONLY`/`TERMINAL` block adds; ELIGIBLE, ETFs (class `ETF`), and unrated
+> names fall through to the price guardrails; `TERMINAL` held names surface an
+> `EXIT` recommendation. `--ignore-durability` shows raw price signals.
 
 ## Sell side (implemented)
 

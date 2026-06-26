@@ -22,9 +22,9 @@ It also suggests BUYS with the buy-side guardrails, in two modes:
 Size for both = the largest full lot's SHARE count (ever, for re-entry) x a
 drawdown factor (full to -20%, tapering to 0 at -50%), valued at the current
 price. Blocked by the 200-day-MA breaker (below a falling MA for >=
-MA_BREAKER_DAYS), an optional --position-cap, and the DURABILITY GATE: only
-ELIGIBLE names (the `durability` table from build_durability.py) can be bought -
-HOLD_ONLY / TERMINAL / unclassified names are blocked from adds. TERMINAL names
+MA_BREAKER_DAYS), an optional --position-cap, and the DURABILITY GATE: names the
+`durability` table marks HOLD_ONLY or TERMINAL are blocked from adds; ELIGIBLE,
+ETFs, and unrated names fall through to the price guardrails. TERMINAL names
 additionally surface an EXIT recommendation (the terminal-risk downside exit).
 `--ignore-durability` turns the gate + exits off. Metrics from build_metrics.py;
 fully-exited (zero-share) names are handled manually.
@@ -312,7 +312,7 @@ def main():
     print(f"  size = largest full lot's shares x drawdown factor (full to -{DD_FULL_PCT:.0f}%, "
           f"taper to -{DD_STOP_PCT:.0f}%); MA-breaker {MA_BREAKER_DAYS}d"
           + (f"; cap ${cap:,.0f}/name" if cap else ""))
-    print("  durability gate: ELIGIBLE only"
+    print("  durability gate: blocks HOLD_ONLY / TERMINAL (ETFs + unrated pass)"
           if not args.ignore_durability else "  durability gate: OFF (--ignore-durability)")
     buy_recs, blocked = [], []
     bcounts = {"buy": 0, "blocked": 0, "hold": 0, "noprice": 0}
@@ -342,8 +342,10 @@ def main():
         # --- durability gate + guardrail sizing ---
         if armed:
             dclass = (durability.get(symbol) or {}).get("class")
-            if not args.ignore_durability and dclass != "ELIGIBLE":
-                status, reason = "BLOCKED", f"durability={dclass or 'unclassified'}"
+            # Block only names explicitly judged non-durable. ETFs and unrated
+            # names fall through to the price guardrails below.
+            if not args.ignore_durability and dclass in ("HOLD_ONLY", "TERMINAL"):
+                status, reason = "BLOCKED", f"durability={dclass}"
                 bcounts["blocked"] += 1
                 blocked.append((acct, symbol, reason, reentry))
             else:

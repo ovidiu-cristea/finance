@@ -29,7 +29,8 @@ from pathlib import Path
 
 import requests
 
-from durability_core import CONFIG, HEADER, compute, fmt_row, held_tickers, load_flags, upsert
+from durability_core import (
+    CONFIG, HEADER, compute, fmt_row, held_tickers, load_flags, mark_etf, upsert)
 
 HERE = Path(__file__).resolve().parent
 BASE_URL = "https://api.massive.com"
@@ -85,9 +86,9 @@ def main():
             details = fetch_details(t, api_key)
             first = False
             if (details.get("type") or "").upper() in ETF_TYPES:
-                conn.execute("DELETE FROM durability WHERE symbol = ?", (t,))
+                mark_etf(conn, t)
                 conn.commit()
-                print(f"  {t:<8} skipped (ETF/fund)")
+                print(f"  {t:<8} ETF/fund (durability n/a)")
                 continue
             time.sleep(args.delay)
             reports = fetch_financials(t, api_key, args.years)
