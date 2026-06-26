@@ -184,6 +184,97 @@ CREATE INDEX IF NOT EXISTS idx_realized_extref
     ON realized_events (external_ref);
 
 -- ---------------------------------------------------------------------------
+-- Per-stock price metrics (cache; rebuilt from Massive history by build_metrics.py)
+-- ---------------------------------------------------------------------------
+
+-- One row per ticker, refreshed end-of-day. Feeds the buy-side guardrails
+-- (drawdown-scaled sizing, 200-day-MA breaker) and terminal-risk signals.
+CREATE TABLE IF NOT EXISTS stock_metrics (
+    symbol        TEXT PRIMARY KEY,
+    as_of         TEXT,          -- date of the latest bar used
+    last_close    REAL,
+    high_52w      REAL,          -- max daily high over ~252 trading days
+    drawdown_pct  REAL,          -- (last_close / high_52w - 1) * 100
+    ma_200        REAL,          -- 200-day simple moving average of closes
+    ma_200_slope  REAL,          -- ma_200 now minus ma_200 ~20 trading days ago (sign = trend)
+    atr_pct       REAL,          -- ATR(14) / last_close * 100
+    below_ma_days INTEGER,       -- consecutive recent days closed below the 200-day MA
+    bars          INTEGER,       -- number of daily bars used
+    computed_at   TEXT           -- ISO timestamp of this computation
+);
+
+-- ---------------------------------------------------------------------------
+-- Durability whitelist (fundamentals gate; rebuilt from Massive by build_durability.py)
+-- ---------------------------------------------------------------------------
+
+-- One row per ticker, refreshed quarterly. Classifies a name's ability to
+-- survive long enough for the mean-reversion strategy to pay off:
+--   class = ELIGIBLE   -> buying/re-entry open
+--           HOLD_ONLY  -> hold existing lots, do not add, do not force-exit
+--           TERMINAL   -> a hard veto tripped: stop buying + recommend exit
+-- `score` (0-100, configurable weights) ranks ELIGIBLE vs HOLD_ONLY; vetoes are
+-- absolute and force TERMINAL regardless of score. `manual_flag` is user-set
+-- (going-concern / Ch.11 / delisting) and is PRESERVED across rebuilds.
+CREATE TABLE IF NOT EXISTS durability (
+    symbol            TEXT PRIMARY KEY,
+    class             TEXT,          -- ELIGIBLE | HOLD_ONLY | TERMINAL
+    score             REAL,          -- total quality score 0-100
+    score_balance     REAL,          -- balance-sheet strength component
+    score_burn        REAL,          -- profitability / burn-trend component
+    score_revenue     REAL,          -- revenue-trend component
+    score_scale       REAL,          -- market-cap scale component
+    market_cap        REAL,
+    total_assets      REAL,
+    total_liabilities REAL,
+    equity            REAL,
+    current_assets    REAL,
+    current_liabilities REAL,
+    revenues          REAL,
+    operating_income  REAL,
+    net_income        REAL,
+    ocf               REAL,          -- annual operating cash flow (negative = burning)
+    runway_quarters   REAL,          -- current_assets / quarterly OCF burn (NULL if not burning)
+    rev_cagr          REAL,          -- revenue CAGR over available annual reports
+    burn_trend        REAL,          -- YoY change in OCF (positive = burn improving)
+    vetoes            TEXT,          -- comma-list of tripped hard vetoes ('' if none)
+    manual_flag       TEXT,          -- manual going-concern/Ch.11/delisting note (user-set, preserved)
+    fiscal_year       TEXT,          -- fiscal year of the latest report used
+    as_of             TEXT,          -- end_date of the latest report used
+    computed_at       TEXT
+);
+
+-- ---------------------------------------------------------------------------
+-- Strategy backtest cache (per-ticker sim metrics; rebuilt by backtest_strategy.py)
+-- ---------------------------------------------------------------------------
+
+-- One row per ticker: how the volatility-harvesting strategy would have performed
+-- on that name's price history (strategy_sim.py). The reference set held names are
+-- compared against, so a candidate can be characterized by analogy ("behaves like
+-- QS" vs "like INTC"). All returns are fractions; capital is normalized.
+CREATE TABLE IF NOT EXISTS strategy_backtest (
+    symbol            TEXT PRIMARY KEY,
+    start_date        TEXT,
+    end_date          TEXT,
+    years             REAL,
+    buys              INTEGER,
+    sells             INTEGER,
+    total_invested    REAL,
+    max_capital       REAL,          -- peak simultaneous position cost (capital at risk)
+    realized_pnl      REAL,          -- harvested gains
+    unrealized_pnl    REAL,          -- final residual mark-to-market
+    total_pnl         REAL,
+    return_on_capital REAL,          -- total_pnl / max_capital
+    bh_return         REAL,          -- buy-and-hold the seed lot, same window
+    edge_vs_hold      REAL,          -- return_on_capital - bh_return
+    max_drawdown      REAL,          -- deepest net-P&L drawdown, fraction of max_capital
+    risk_adjusted     REAL,          -- return_on_capital / max_drawdown
+    harvest_per_year  REAL,          -- sells per year (oscillation frequency)
+    atr_pct           REAL,          -- end-of-window volatility
+    final_drawdown    REAL,          -- end-of-window drawdown from 52wk high
+    computed_at       TEXT
+);
+
+-- ---------------------------------------------------------------------------
 -- Convenience view
 -- ---------------------------------------------------------------------------
 

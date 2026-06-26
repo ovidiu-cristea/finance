@@ -19,7 +19,8 @@ Fidelity lot view ──paste──▶ reconcile_lots.py ──▶ holdings.db �
 ## Prerequisites
 
 - Python 3.12+
-- Packages: `pip install snaptrade-python-sdk openpyxl requests`
+- Packages: `pip install snaptrade-python-sdk openpyxl requests yfinance`
+  (`yfinance` only for `build_durability_yf.py`, the foreign-ADR fallback)
 - **`ConsumerKey.txt`** — SnapTrade consumer key for the personal client
   `PERS-97BRLMMWM55XNVEEORUA` (client id is hardcoded in the scripts; the
   consumer key lives in this file and is passed at runtime).
@@ -37,7 +38,10 @@ Fidelity lot view ──paste──▶ reconcile_lots.py ──▶ holdings.db �
 | `tax_lots` | Open lots with `remaining_quantity`; seeded manually, then maintained by the sync. |
 | `planned_orders` / `planned_order_lots` | Orders recorded at placement time, with specific-lot intent for sells. |
 | `executed_orders` | Ledger of orders ingested from SnapTrade (idempotent; carries `needs_review`). |
-| `realized_events` | Lot closures (realized gains/losses) and manual dividends. |
+| `realized_events` | Lot closures (realized gains/losses), manual dividends, lending income. |
+| `stock_metrics` | Per-stock price metrics (52wk high, drawdown, 200-day MA + slope, ATR%, days-below-MA) from Massive history; feeds the buy-side guardrails. |
+| `durability` | Per-stock fundamentals gate (class ELIGIBLE/HOLD_ONLY/TERMINAL + quality score + raw financials) from Massive; the buy-side whitelist and terminal-risk exit. |
+| `strategy_backtest` | Per-stock backtest of the strategy on price history (return vs buy-and-hold, drawdown, harvest frequency); the reference set candidates are compared against. |
 
 > Note: sqlite3 has foreign keys **off** by default — every connection runs
 > `PRAGMA foreign_keys = ON` (the scripts do this).
@@ -117,20 +121,122 @@ python disambiguate_sells.py <consumer-key-file> <TICKER> <paste-file> [--accoun
 python disambiguate_sells.py ConsumerKey.txt QS qs.txt --apply
 ```
 
+#### `build_metrics.py` — per-stock price metrics from Massive history
+For each held ticker, pulls ~`--days` (420) of adjusted daily bars from Massive's
+`/v2/aggs/.../range/1/day/...` endpoint and computes/stores into `stock_metrics`:
+52-week high, drawdown from it, 200-day MA + slope, ATR%, and consecutive days
+closed below the 200-day MA. Idempotent (upsert per symbol); run end-of-day.
+Feeds the buy-side guardrails. `--delay` throttles API calls (default 12s;
+full run ~12 min — lower if your plan allows). `--ticker` does one symbol.
+```
+python build_metrics.py <massive-api-key-file> [--ticker QS] [--days 420] [--delay 12] [--db X]
+```
+
+#### `build_durability.py` — fundamentals durability whitelist from Massive
+For each held ticker, pulls company details (`market_cap`) and the last `--years`
+(4) annual financial statements from Massive and classifies survival-ability into
+the `durability` table: `ELIGIBLE` (buy/re-enter open), `HOLD_ONLY` (hold, don't
+add, don't force-exit), or `TERMINAL` (a hard veto tripped -> stop buying +
+recommend exit). Hard vetoes are absolute: micro-cap (< $300M), negative equity,
+cash runway < 4 quarters (when burning), or a user-set `manual_flag`
+(going-concern / Ch.11 / delisting). Otherwise a configurable quality score
+(balance-sheet strength, burn/profitability trend, revenue trend, scale; 0-100,
+ELIGIBLE >= 60) ranks the name. Deliberately contrarian — vetoes only genuine
+terminal risk, never mere unprofitability. All thresholds/weights live in the
+`CONFIG` block at the top of the script. `manual_flag` is read as a veto and
+preserved across rebuilds (set it in DB Browser). ETFs/funds are skipped (and any
+stale ETF row deleted) - they aren't businesses. Foreign ADRs Massive doesn't
+cover show `no financials`; pass `--fallback-yf` to classify those gaps via
+yfinance in a second pass after the Massive pass (Massive stays authoritative -
+yfinance only fills names Massive couldn't; needs `pip install yfinance`).
+Idempotent upsert; refresh quarterly. `--delay` throttles API calls (2 per ticker).
+The scoring/veto logic + `CONFIG` live in `durability_core.py` (shared with the
+yfinance fetcher); this script only does the Massive HTTP calls.
+```
+python build_durability.py <massive-api-key-file> [--ticker QS] [--years 4] [--delay 12] [--db X]
+python build_durability.py ConsumerKeyMassive.txt --fallback-yf      # full refresh, one command
+```
+
+#### `build_durability_yf.py` — durability for foreign ADRs (yfinance fallback)
+Massive only parses US-GAAP filings, so European ADRs (RACE, STLA, LVMUY, BUD,
+DASTY, HGRAF, ...) come back `no financials` from `build_durability.py`. This
+adapter pulls the same line items from Yahoo Finance and feeds the **same**
+`durability_core.py` scoring + `durability` table, so a foreign name is
+scored/vetoed identically to a US one. Run it standalone, or let
+`build_durability.py --fallback-yf` invoke it automatically for the gaps.
+Standalone it targets held tickers with no `durability` row yet (the leftovers
+from a Massive run) and skips anything Yahoo flags as an ETF/fund. Statements are in the home
+currency (shown under `cur`); every metric is a ratio so currency cancels, and
+the only absolute threshold (cap floor) uses Yahoo's USD `marketCap`. Needs
+`pip install yfinance`.
+```
+python build_durability_yf.py [--ticker RACE] [--years 4] [--delay 1] [--db X]
+```
+
+#### `durability_core.py` — shared durability scoring (module, not a script)
+The vendor-agnostic scoring core: `CONFIG` (all veto thresholds + score weights),
+`compute()` (vetoes + quality score + class), `upsert()`, and the shared output
+formatting. Imported by both `build_durability.py` (Massive) and
+`build_durability_yf.py` (yfinance) so a name is scored identically regardless of
+source. Tune the whitelist here.
+
 #### `recommend_orders.py` — end-of-day trade recommendations
 Suggests, from the DB + an end-of-day price file, what to trade today. **Sells:**
 trailing stop-loss per targeted lot — recommends a SELL STOP at `price × (1 −
 3.5%)` once that clears the lot's profit target, ratcheting up daily (low-target
-lots sell 90%, high-target sell all). **Buys:** average-down trigger — a BUY when
-the price is ≥10% below the cheapest *full* lot's per-share cost (full = a
-low-target/10% lot; 50%-target remainder lots are excluded). v1 base rule;
-buy-side guardrails not yet applied. Price source: `--prices-csv` (the Massive
-VWAP file from `extract_tickers.py`) or live SnapTrade. Read-only. `--all` shows
-every lot/position with its status.
+lots sell 90%, high-target sell all). **Buys** (two modes): **add** — a BUY when the price is ≥10% below the cheapest
+*full* lot (low-target/10% lot); **re-enter** — for a name run up and trimmed
+away (no full lot left), a BUY once it's ≥25% below its 52-week high. Both are
+**sized** by the largest full lot's **share count** (ever, for re-entry) × a
+drawdown factor (full to −20%, tapering to 0 at −50%), blocked by the 200-day-MA
+breaker (below a *falling* MA for ≥~6 months) and an optional `--position-cap`.
+**Durability gate:** a buy is only recommended for an `ELIGIBLE` name (the
+`durability` table from `build_durability.py`); `HOLD_ONLY` / `TERMINAL` /
+unclassified names are blocked from adds (shown as `durability=<class>`).
+**Exits:** `TERMINAL` names held with shares surface an `EXIT` recommendation —
+the terminal-risk downside exit (e.g. FLNA). `--ignore-durability` turns the gate
++ exits off to show raw price signals. Reads `stock_metrics` (populate with
+`build_metrics.py`) and `durability`; fully-exited (zero-share) names are handled
+manually. Price source: `--prices-csv` (the Massive VWAP file from
+`extract_tickers.py`) or live SnapTrade. Read-only. `--all` shows every
+lot/position with its status.
 ```
 python recommend_orders.py --prices-csv stocksVWAP-YYYY-MM-DD.csv [--account X] [--all]
-python recommend_orders.py <consumer-key-file> [--account X] [--buffer-pct 3.5]
+python recommend_orders.py <consumer-key-file> [--position-cap 20000] [--ignore-durability]
 ```
+
+#### `backtest_strategy.py` — backtest the strategy across held names
+For each held ticker, pulls ~`--years` (3) + 1y lookback of Massive daily bars and
+replays the volatility-harvesting strategy day-by-day (`strategy_sim.py`), storing
+the result in `strategy_backtest`: return on capital vs. buy-and-hold (`edge`), max
+drawdown, risk-adjusted return, harvest frequency. This is both the **portfolio
+backtest** (how the strategy did on what you own) and the **reference set** the
+candidate screener compares against. Every buy/sell/size decision routes through
+`strategy_core.py` (same code as the live recommender). `--delay` throttles API
+calls (1 per ticker); `--ticker` does one.
+```
+python backtest_strategy.py <massive-api-key-file> [--ticker QS] [--years 3] [--delay 12]
+```
+
+#### `analyze_ticker.py` — screen a candidate ticker
+Given one ticker: classifies its **durability** (Massive, yfinance fallback),
+**backtests** the strategy on its price history, then drops its row into the
+cached portfolio table and names its **closest behavioral analogs** ("behaves like
+QS" vs "like INTC") by a z-scored fingerprint (volatility, drawdown, harvest
+frequency, direction, edge). Run `backtest_strategy.py` first to populate the
+reference set.
+```
+python analyze_ticker.py <massive-api-key-file> <TICKER> [--years 3]
+```
+
+#### `strategy_core.py` / `strategy_sim.py` — strategy math + simulator (modules)
+`strategy_core.py` is the pure trigger/sizing logic (`add_size_factor`,
+`evaluate_buy`, `evaluate_lot`, `sell_quantity` + the constants), shared by the
+live `recommend_orders.py` and the backtest so they can't drift. `strategy_sim.py`
+is the day-by-day simulator: `simulate(bars, window_start, params, initial_lots)`
+replays average-down buys, trailing-stop sells, and re-entry over a price series
+and returns the metric set. Seed a synthetic lot (screening) or real lots
+(portfolio backtest).
 
 #### `realized_gains.py` — report realized gains from sell orders
 Sums `realized_events` (written by `ingest_orders` / `disambiguate_sells`) per

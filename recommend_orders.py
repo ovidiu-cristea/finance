@@ -14,12 +14,20 @@ lower it, so you capture the upside and sell when the stock turns down.
 Order size: lots at the low target (10%) sell 90% of their shares (rounded down
 to a whole share); lots at the high target sell the full remaining quantity.
 
-It also suggests average-down BUYS: per (account, symbol), a BUY when the current
-price is >= BUY_DIP_PCT% (10%) below the cheapest FULL lot's per-share cost
-(full = a low-target/10% lot; 50%-target remainder lots are excluded).
-This is the v1 base trigger only - the buy-side guardrails (drawdown-scaled
-sizing, 200-day-MA breaker, position cap, durability whitelist) are not yet
-applied. No size is suggested.
+It also suggests BUYS with the buy-side guardrails, in two modes:
+  * ADD (held full lots): price >= BUY_DIP_PCT% (10%) below the cheapest FULL lot
+    (low-target/10% lot).
+  * RE-ENTER (no full lot left - ran up and trimmed away): >= RE_ENTRY_DIP_PCT%
+    (25%) below the 52-week high (from stock_metrics).
+Size for both = the largest full lot's SHARE count (ever, for re-entry) x a
+drawdown factor (full to -20%, tapering to 0 at -50%), valued at the current
+price. Blocked by the 200-day-MA breaker (below a falling MA for >=
+MA_BREAKER_DAYS), an optional --position-cap, and the DURABILITY GATE: only
+ELIGIBLE names (the `durability` table from build_durability.py) can be bought -
+HOLD_ONLY / TERMINAL / unclassified names are blocked from adds. TERMINAL names
+additionally surface an EXIT recommendation (the terminal-risk downside exit).
+`--ignore-durability` turns the gate + exits off. Metrics from build_metrics.py;
+fully-exited (zero-share) names are handled manually.
 
 Price source: an end-of-day CSV (e.g. Massive VWAP via extract_tickers.py) with
 --prices-csv, or live SnapTrade positions if a consumer-key file is given.
@@ -32,34 +40,19 @@ Usage:
 """
 import argparse
 import csv
-import math
 import sqlite3
 import sys
 from pathlib import Path
 
 from rebrands import canonical_symbol
+from strategy_core import (
+    BUY_DIP_PCT, DD_FULL_PCT, DD_STOP_PCT, DEFAULT_BUFFER_PCT, EPSILON,
+    LOW_SELL_FRACTION, LOW_TARGET_PCT, MA_BREAKER_DAYS, RE_ENTRY_DIP_PCT,
+    add_size_factor, evaluate_buy, evaluate_lot, sell_quantity,
+)
 
 HERE = Path(__file__).resolve().parent
 CLIENT_ID = "PERS-97BRLMMWM55XNVEEORUA"
-DEFAULT_BUFFER_PCT = 3.5
-
-# Lots at the low target sell only part of the position; high-target lots sell all.
-LOW_TARGET_PCT = 10.0
-LOW_SELL_FRACTION = 0.90
-
-# Average-down BUY trigger: buy when price is this % below the cheapest open lot.
-# (v1 base rule only - the buy-side guardrails from STRATEGY.md are not applied yet.)
-BUY_DIP_PCT = 10.0
-EPSILON = 1e-9
-
-
-def sell_quantity(remaining, target_pct):
-    """Shares to sell for a lot: 90% (rounded down to a whole share) at the low
-    target, otherwise the full remaining quantity. Rounding down means a small
-    low-target lot always keeps at least one share."""
-    if abs(target_pct - LOW_TARGET_PCT) < 1e-9:
-        return math.floor(remaining * LOW_SELL_FRACTION)
-    return remaining
 
 
 def to_float(value):
@@ -76,32 +69,28 @@ def read_secret(path):
     return secret
 
 
-def evaluate_lot(per_share, target_pct, price, buffer_pct):
-    """Return (status, target_price, arm_price, stop).
-
-    status is one of armed / watch / below / noprice. `arm_price` is the price at
-    which a buffer% trailing stop first reaches the target. `stop` is set only
-    when armed (= current price minus buffer%, which by construction >= target).
-    """
-    target_price = per_share * (1 + target_pct / 100)
-    factor = 1 - buffer_pct / 100
-    arm_price = target_price / factor if factor > 0 else None
-    if price is None:
-        return "noprice", target_price, arm_price, None
-    stop = price * factor
-    if stop >= target_price:
-        return "armed", target_price, arm_price, stop
-    if price >= target_price:
-        return "watch", target_price, arm_price, None
-    return "below", target_price, arm_price, None
+def load_metrics(db_path):
+    """Return {symbol: {drawdown_pct, below_ma_days, ma_200_slope, ...}} from stock_metrics."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return {r["symbol"]: dict(r) for r in conn.execute("SELECT * FROM stock_metrics")}
+    except sqlite3.OperationalError:
+        return {}  # table not built yet
+    finally:
+        conn.close()
 
 
-def evaluate_buy(cheapest_cost, price, dip_pct):
-    """Average-down trigger. Returns (armed, threshold) where threshold is the
-    price at/below which to buy (cheapest open lot minus dip_pct%)."""
-    threshold = cheapest_cost * (1 - dip_pct / 100)
-    armed = price is not None and price <= threshold + EPSILON
-    return armed, threshold
+def load_durability(db_path):
+    """Return {symbol: {class, score, vetoes, ...}} from the durability table."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return {r["symbol"]: dict(r) for r in conn.execute("SELECT * FROM durability")}
+    except sqlite3.OperationalError:
+        return {}  # table not built yet
+    finally:
+        conn.close()
 
 
 def read_prices_csv(path):
@@ -164,29 +153,52 @@ def load_lots(db_path, account_filter):
 
 
 def load_positions(db_path, account_filter):
-    """Per (account, symbol): cheapest FULL-lot per-share cost, shares, lot count.
-
-    The average-down anchor is the cheapest *full* lot = a low-target (10%) lot.
-    High-target (50%) lots are the trimmed remainders / high-conviction holds and
-    are excluded, so a position needs a low-target lot to be a buy candidate."""
+    """Per (account, symbol): cheapest FULL-lot per-share cost and largest FULL-lot
+    share count (low-target/10% lots only - the average-down anchor + base buy size;
+    NULL if the position has no full lot), plus TOTAL held shares (all open lots,
+    for the position cap) and lot count."""
     rows = sqlite3.connect(db_path).execute(
         """
         SELECT t.account_id, a.name, a.number, t.symbol,
-               MIN(t.cost_basis / t.original_quantity) AS cheapest,
-               SUM(t.remaining_quantity)               AS shares,
-               COUNT(*)                                AS lots
+               MIN(CASE WHEN ABS(t.target_min_profit_pct - ?) < 0.001
+                        THEN t.cost_basis / t.original_quantity END) AS cheapest,
+               MAX(CASE WHEN ABS(t.target_min_profit_pct - ?) < 0.001
+                        THEN t.original_quantity END)                AS base_shares,
+               SUM(t.remaining_quantity)                              AS shares,
+               COUNT(*)                                               AS lots
         FROM tax_lots t JOIN accounts a ON a.id = t.account_id
         WHERE t.status = 'open' AND t.original_quantity > 0
-          AND ABS(t.target_min_profit_pct - ?) < 0.001
         GROUP BY t.account_id, t.symbol
         ORDER BY a.name, t.symbol
         """,
-        (LOW_TARGET_PCT,),
+        (LOW_TARGET_PCT, LOW_TARGET_PCT),
     ).fetchall()
     if account_filter:
         rows = [r for r in rows
                 if r[0] == account_filter or str(r[2] or "").endswith(account_filter)]
     return rows
+
+
+def largest_full_lot_ever(db_path, account_filter):
+    """{(account_id, symbol): largest full-lot share count ever held}, over ALL
+    low-target lots (open OR closed) - the re-entry base size for names whose
+    open full lots have been trimmed away."""
+    rows = sqlite3.connect(db_path).execute(
+        """
+        SELECT t.account_id, a.number, t.symbol, MAX(t.original_quantity)
+        FROM tax_lots t JOIN accounts a ON a.id = t.account_id
+        WHERE t.original_quantity > 0 AND ABS(t.target_min_profit_pct - ?) < 0.001
+        GROUP BY t.account_id, t.symbol
+        """,
+        (LOW_TARGET_PCT,),
+    ).fetchall()
+    out = {}
+    for acct_id, number, symbol, mx in rows:
+        if account_filter and not (acct_id == account_filter
+                                   or str(number or "").endswith(account_filter)):
+            continue
+        out[(acct_id, symbol)] = mx
+    return out
 
 
 def main():
@@ -200,10 +212,17 @@ def main():
                     help="Trailing-stop distance below price, also the arming margin (default 3.5)")
     ap.add_argument("--all", action="store_true",
                     help="Show every targeted lot with its status, not just armed ones")
+    ap.add_argument("--position-cap", type=float,
+                    help="Stop adding once a name's held value reaches this $ (off by default)")
+    ap.add_argument("--ignore-durability", action="store_true",
+                    help="Disable the durability gate + terminal-risk exits (show raw price signals)")
     args = ap.parse_args()
 
     lots = load_lots(args.db, args.account)
     positions = load_positions(args.db, args.account)
+    ever_shares = largest_full_lot_ever(args.db, args.account)
+    metrics = load_metrics(args.db)
+    durability = load_durability(args.db)
     account_ids = {p[0] for p in positions} | {r[0] for r in lots}
 
     if args.prices_csv:
@@ -266,44 +285,121 @@ def main():
     print(f"\nLots: armed={counts['armed']}  watching={counts['watch']}  "
           f"below_target={counts['below']}  no_price={counts['noprice']}")
 
-    # ---- BUY (average-down) recommendations ----
-    print(f"\n=== BUY (average-down) - price <= cheapest full (10%) lot x {1 - BUY_DIP_PCT/100:.2f} ===")
-    print("  (v1 base trigger only; size + buy-side guardrails not applied yet)")
-    buy_recs = []
-    bcounts = {"buy": 0, "hold": 0, "noprice": 0}
+    # ---- EXIT recommendations: terminal-risk names (durability) ----
+    if not args.ignore_durability:
+        print("\n=== EXIT recommendations (terminal-risk durability) ===")
+        exits = [(acct, symbol, shares, prices.get(symbol), durability[symbol].get("vetoes"))
+                 for (acct_id, acct, number, symbol, cheapest, base_shares, shares, nlots) in positions
+                 if (shares or 0) > 0 and (durability.get(symbol) or {}).get("class") == "TERMINAL"]
+        if not exits:
+            print("  (none)")
+        else:
+            cur_acct = None
+            for acct, symbol, shares, price, vetoes in exits:
+                if acct != cur_acct:
+                    print(f"\n{acct}")
+                    cur_acct = acct
+                pstr = f"${price:,.2f}" if price is not None else "n/a"
+                val = f"~${shares * price:,.0f}" if price is not None else "n/a"
+                print(f"  EXIT {shares:>7g} {symbol:<8} @ {pstr}  ({val})  "
+                      f"[terminal: {vetoes or 'manual'}]")
+
+    # ---- BUY recommendations: average-down (held full lots) + re-entry (trimmed away) ----
+    cap = args.position_cap
+    print("\n=== BUY recommendations ===")
+    print(f"  add:      price <= cheapest full (10%) lot x {1 - BUY_DIP_PCT/100:.2f}")
+    print(f"  re-entry: no full lot left, >= {RE_ENTRY_DIP_PCT:.0f}% off the 52-week high")
+    print(f"  size = largest full lot's shares x drawdown factor (full to -{DD_FULL_PCT:.0f}%, "
+          f"taper to -{DD_STOP_PCT:.0f}%); MA-breaker {MA_BREAKER_DAYS}d"
+          + (f"; cap ${cap:,.0f}/name" if cap else ""))
+    print("  durability gate: ELIGIBLE only"
+          if not args.ignore_durability else "  durability gate: OFF (--ignore-durability)")
+    buy_recs, blocked = [], []
+    bcounts = {"buy": 0, "blocked": 0, "hold": 0, "noprice": 0}
     cur_acct = None
-    for (acct_id, acct, number, symbol, cheapest, shares, nlots) in positions:
-        if cheapest is None:
-            bcounts["noprice"] += 1
-            continue
+    for (acct_id, acct, number, symbol, cheapest, base_shares, shares, nlots) in positions:
         price = prices.get(symbol)
-        armed, threshold = evaluate_buy(cheapest, price, BUY_DIP_PCT)
-        bcounts["buy" if armed else ("noprice" if price is None else "hold")] += 1
+        m = metrics.get(symbol)
+        reentry = cheapest is None  # no full lot left -> re-entry candidate
+        base = ever_shares.get((acct_id, symbol)) if reentry else base_shares
+
+        status, reason, factor, buy_shares, note = "hold", "", 0.0, 0.0, ""
+        # --- trigger ---
+        if price is None:
+            status, armed = "NOPRICE", False
+            bcounts["noprice"] += 1
+        elif reentry:
+            dd = (m or {}).get("drawdown_pct")
+            armed = dd is not None and dd <= -RE_ENTRY_DIP_PCT
+            note = f"re-entry, {-dd:.0f}% off high" if armed else ""
+            if not armed:
+                bcounts["hold"] += 1
+        else:
+            armed, _ = evaluate_buy(cheapest, price, BUY_DIP_PCT)
+            note = f"{(cheapest - price) / cheapest * 100:.0f}% below ${cheapest:,.2f}" if armed else ""
+            if not armed:
+                bcounts["hold"] += 1
+        # --- durability gate + guardrail sizing ---
         if armed:
-            buy_recs.append((acct, symbol, price, cheapest, threshold))
+            dclass = (durability.get(symbol) or {}).get("class")
+            if not args.ignore_durability and dclass != "ELIGIBLE":
+                status, reason = "BLOCKED", f"durability={dclass or 'unclassified'}"
+                bcounts["blocked"] += 1
+                blocked.append((acct, symbol, reason, reentry))
+            else:
+                if not m:
+                    factor, reason = 0.0, "no metrics (run build_metrics)"
+                elif not base:
+                    factor, reason = 0.0, "no full-lot size reference"
+                else:
+                    factor, reason = add_size_factor(
+                        m.get("drawdown_pct"), m.get("below_ma_days"), m.get("ma_200_slope"))
+                    if cap and (shares or 0) * price >= cap and factor > 0:
+                        factor, reason = 0.0, f"at position cap (${(shares or 0) * price:,.0f})"
+                buy_shares = round((base or 0) * factor)
+                if factor > EPSILON and buy_shares >= 1:
+                    status = "RE-ENTER" if reentry else "BUY"
+                    bcounts["buy"] += 1
+                    buy_recs.append((acct, symbol, price, factor, base, buy_shares, reason, note, reentry))
+                else:
+                    status = "BLOCKED"
+                    if factor > EPSILON and buy_shares < 1:
+                        reason += " (rounds to 0 sh)"
+                    bcounts["blocked"] += 1
+                    blocked.append((acct, symbol, reason, reentry))
         if args.all:
             if acct != cur_acct:
                 print(acct)
                 cur_acct = acct
             pstr = f"${price:,.2f}" if price is not None else "n/a"
-            tag = "BUY" if armed else ("NOPRICE" if price is None else "hold")
-            print(f"  {symbol:<8} cheapest ${cheapest:,.2f}  buy<=${threshold:,.2f}  "
-                  f"last {pstr}  [{tag}]")
+            if reentry:
+                ddv = (m or {}).get("drawdown_pct")
+                dds = f"{ddv:+.0f}%" if ddv is not None else "n/a"
+                print(f"  {symbol:<8} re-entry drawdown {dds} (need <=-{RE_ENTRY_DIP_PCT:.0f}%)  "
+                      f"last {pstr}  [{status}] {reason}")
+            else:
+                print(f"  {symbol:<8} add cheapest ${cheapest:,.2f}  "
+                      f"buy<=${cheapest * (1 - BUY_DIP_PCT/100):,.2f}  last {pstr}  [{status}] {reason}")
 
     if args.all:
         print()
+    cur_acct = None
     if buy_recs:
-        cur_acct = None
-        for acct, symbol, price, cheapest, threshold in buy_recs:
+        for acct, symbol, price, factor, base, buy_shares, reason, note, reentry in buy_recs:
             if acct != cur_acct:
                 print(f"{acct}")
                 cur_acct = acct
-            below = (cheapest - price) / cheapest * 100
-            print(f"  BUY {symbol:<8}  last ${price:,.2f}  "
-                  f"({below:.1f}% below cheapest lot ${cheapest:,.2f}, buy <= ${threshold:,.2f})")
+            tag = "RE-ENTER" if reentry else "BUY"
+            print(f"  {tag:<8} {buy_shares:>6g} {symbol:<8}  ~${buy_shares * price:,.0f} "
+                  f"({factor:.0%} of {base:g}-sh lot) @ ${price:,.2f}   [{reason}; {note}]")
     else:
         print("  (none triggered)")
-    print(f"\nPositions: buy={bcounts['buy']}  hold={bcounts['hold']}  no_price={bcounts['noprice']}")
+    if blocked:
+        print("\n  Armed but blocked by guardrails:")
+        for acct, symbol, reason, reentry in blocked:
+            print(f"    {symbol:<8} ({acct}){' (re-entry)' if reentry else ''} - {reason}")
+    print(f"\nPositions: buy={bcounts['buy']}  blocked={bcounts['blocked']}  "
+          f"hold={bcounts['hold']}  no_price={bcounts['noprice']}")
 
 
 if __name__ == "__main__":
